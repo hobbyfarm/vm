@@ -3,6 +3,7 @@ package vm
 import (
 	"errors"
 	"fmt"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/golang/glog"
 	corev1 "k8s.io/api/core/v1"
@@ -18,12 +19,41 @@ import (
 func (ctrl *VirtualMachineController) migrateMachine(machine *api.VirtualMachine) error {
 	switch machine.Status.State {
 	case api.StateRunning:
-		machine2 := machine.DeepCopy()
-		machine2.Status.State = api.StateMigrating
-		if err := ctrl.updateMachineStatus(machine, machine2); err != nil {
+		if err := func() error {
+			retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() (error) {
+				//toUpdate, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine.Name, metav1.GetOptions{})
+				toUpdate, err := ctrl.machineLister.Get(machine.Name)
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						return nil
+					} else {
+						glog.Errorf("unknown error encountered when updating %v", err)
+					}
+				}
+				if toUpdate.Status.State == api.StateMigrating {
+					return nil
+				}
+				toUpdate.Status.State = api.StateMigrating
+				glog.V(5).Infof("setting state to migrating for %s", machine.Name)
+				toUpdate, updateErr := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(toUpdate)
+				if err := ctrl.verifyMachine(toUpdate); err != nil {
+					glog.Errorf("error while verifying machine!!! %s", toUpdate.Name)
+				}
+				return updateErr
+			})
+
+			if retryErr != nil {
+				glog.Errorf("error while updating vm object while updating %v", retryErr)
+			}
+			return retryErr
+		}(); err != nil {
 			return err
 		}
-		machine = machine2
+		var err error
+		machine, err = ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine.Name, metav1.GetOptions{})
+		if err != nil {
+			glog.Error("error while retrieving vm %v", err)
+		}
 	case api.StateMigrating:
 		break
 	default:
@@ -66,29 +96,48 @@ func (ctrl *VirtualMachineController) migrateRollback(machine *api.VirtualMachin
 		return err
 	}
 
-	machine2 := machine.DeepCopy()
-	machine2.Status.State = api.StateRunning
-	return ctrl.updateMachineStatus(machine, machine2)
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		//toUpdate, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine.Name, metav1.GetOptions{})
+		toUpdate, err := ctrl.machineLister.Get(machine.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			} else {
+				glog.Errorf("unknown error encountered when stopping %v", err)
+			}
+		}
+		if toUpdate.Status.State == api.StateRunning {
+			return nil
+		}
+		toUpdate.Status.State = api.StateRunning
+		glog.V(5).Infof("setting state to running for %s", machine.Name)
+		toUpdate, updateErr := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(toUpdate)
+		if err := ctrl.verifyMachine(toUpdate); err != nil {
+			glog.Errorf("error while verifying machine!!! %s", toUpdate.Name)
+		}
+		return updateErr
+	})
+
+	if retryErr != nil {
+		glog.Errorf("error while updating vm object while stopping %v", retryErr)
+	}
+	return retryErr
 }
 
 var fg = metav1.DeletePropagationForeground
 
 func (ctrl *VirtualMachineController) deleteMigrationJob(machine *api.VirtualMachine) error {
 	return ctrl.kubeClient.BatchV1().Jobs(common.NamespaceVM).Delete(
-		getJobName(machine),
+		GetJobName(machine, "migrate"),
 		&metav1.DeleteOptions{
 			PropagationPolicy: &fg,
 		})
 }
 
-func getJobName(machine *api.VirtualMachine) string {
-	return fmt.Sprintf("%s-migrate", machine.Name)
-}
-
 func (ctrl *VirtualMachineController) migrationCleanup(machine *api.VirtualMachine, oldPod *corev1.Pod, newPod *corev1.Pod) error {
-	machine2 := machine.DeepCopy()
-	machine2.Spec.Action = api.ActionStart
-	if err := ctrl.updateMachineStatusWithPod(machine, machine2, newPod); err != nil {
+	//machine2 := machine.DeepCopy()
+	//machine2.Spec.Action = api.ActionStart
+	if err := ctrl.updateMachineStatusWithPod(machine, newPod); err != nil {
 		return err
 	}
 
@@ -171,7 +220,7 @@ func (ctrl *VirtualMachineController) startMigrateTargetPod(machine *api.Virtual
 }
 
 func (ctrl *VirtualMachineController) runMigrationJob(machine *api.VirtualMachine, oldPod *corev1.Pod, newPod *corev1.Pod) (bool, error) {
-	job, err := ctrl.jobLister.Jobs(common.NamespaceVM).Get(getJobName(machine))
+	job, err := ctrl.jobLister.Jobs(common.NamespaceVM).Get(GetJobName(machine, "migrate"))
 
 	switch {
 	case err == nil:

@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -177,6 +177,7 @@ func (ctrl *VirtualMachineController) jobEventHandler() cache.ResourceEventHandl
 		},
 		Handler: ctrl.queueEventHandler(ctrl.jobQueue),
 	}
+	//return cache.ResourceEventHandler(ctrl.queueEventHandler(ctrl.jobQueue))
 }
 
 func (ctrl *VirtualMachineController) nodeEventHandler() cache.ResourceEventHandler {

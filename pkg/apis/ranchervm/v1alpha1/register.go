@@ -29,6 +29,14 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&VirtualMachine{},
 		&VirtualMachineList{},
+		&ARPTable{},
+		&ARPTableList{},
+		&Credential{},
+		&CredentialList{},
+		&MachineImage{},
+		&MachineImageList{},
+		&Setting{},
+		&SettingList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil

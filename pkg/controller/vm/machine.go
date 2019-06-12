@@ -2,17 +2,19 @@ package vm
 
 import (
 	"fmt"
-	"reflect"
-
+	"github.com/Sirupsen/logrus"
 	"github.com/golang/glog"
+	api "github.com/rancher/vm/pkg/apis/ranchervm/v1alpha1"
 	"github.com/rancher/vm/pkg/common"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
-
-	api "github.com/rancher/vm/pkg/apis/ranchervm/v1alpha1"
+	"k8s.io/client-go/util/retry"
+	"reflect"
+	"strconv"
+	"time"
 )
 
 func (ctrl *VirtualMachineController) machineWorker() {
@@ -93,15 +95,29 @@ func (ctrl *VirtualMachineController) process(machine *api.VirtualMachine, keyOb
 			return err
 		}
 	}
-	// TODO delete host path (or emptyDir refactor)
 
 	if apierrors.IsNotFound(err1) &&
 		apierrors.IsNotFound(err2) &&
 		apierrors.IsNotFound(err3) {
-
-		return ctrl.removeFinalizer(machine)
+		cleaned, err := ctrl.checkCleanupJob(machine)
+		glog.V(5).Infof("cleaned was %v", cleaned)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				glog.V(5).Infof("creating cleanup job")
+				ctrl.createCleanupJob(machine)
+			} else {
+				glog.Error(err)
+			}
+			return fmt.Errorf("hello world")
+		}
+		if cleaned {
+			glog.V(5).Infof("deleting cleanup job")
+			ctrl.deleteCleanupJob(machine)
+			return ctrl.removeFinalizer(machine)
+		}
 	}
-	return nil
+	glog.V(5).Infof("end of the road")
+	return fmt.Errorf("returning here is supposed to happen if we don't delete all the pods and stuff")
 }
 
 func (ctrl *VirtualMachineController) prepareMachine(machine *api.VirtualMachine) (bool, error) {
@@ -112,7 +128,11 @@ func (ctrl *VirtualMachineController) prepareMachine(machine *api.VirtualMachine
 		mutable.Status.ID = fmt.Sprintf("i-%s", uid[:8])
 		mutable.Status.MAC = fmt.Sprintf("%s:%s:%s:%s:%s", common.RancherOUI, uid[:2], uid[2:4], uid[4:6], uid[6:8])
 		mutable.Finalizers = append(mutable.Finalizers, common.FinalizerDeletion)
-		_, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(mutable)
+		glog.V(5).Infof("preparing machine %s", machine.Name)
+		mutable, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(mutable)
+		if err := ctrl.verifyMachine(mutable); err != nil {
+			glog.Errorf("error while verifying machine!!! %s", mutable.Name)
+		}
 		return true, err
 	}
 	return false, nil
@@ -191,9 +211,33 @@ func (ctrl *VirtualMachineController) stop(machine *api.VirtualMachine) (err err
 	} else if !apierrors.IsNotFound(err) {
 		machine2.Status.State = api.StateError
 	}
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		//toUpdate, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine2.Name, metav1.GetOptions{})
+		toUpdate, err := ctrl.machineLister.Get(machine.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			} else {
+				glog.Errorf("unknown error encountered when stopping %v", err)
+			}
+		}
+		if toUpdate.Status.State == machine2.Status.State && toUpdate.Status.NodeName == machine2.Status.NodeName {
+			return nil
+		}
+		toUpdate.Status.State = machine2.Status.State
+		toUpdate.Status.NodeName = machine2.Status.NodeName
+		glog.V(5).Infof("stopping machine %s", machine.Name)
+		toUpdate, updateErr := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(toUpdate)
+		if err := ctrl.verifyMachine(toUpdate); err != nil {
+			glog.Errorf("error while verifying machine!!! %s", toUpdate.Name)
+		}
+		return updateErr
+	})
 
-	err = ctrl.updateMachineStatus(machine, machine2)
-	return
+	if retryErr != nil {
+		glog.Errorf("error while updating vm object while stopping %v", retryErr)
+	}
+	return retryErr
 }
 
 func (ctrl *VirtualMachineController) updateMachinePod(machine *api.VirtualMachine) (machine2 *api.VirtualMachine, pod *corev1.Pod, err error) {
@@ -242,36 +286,53 @@ func (ctrl *VirtualMachineController) updateMachinePod(machine *api.VirtualMachi
 		return
 	}
 
-	machine2 = machine.DeepCopy()
-	err = ctrl.updateMachineStatusWithPod(machine, machine2, pod)
+	err = ctrl.updateMachineStatusWithPod(machine, pod)
 	return
 }
 
-func (ctrl *VirtualMachineController) updateMachineStatusWithPod(machine *api.VirtualMachine, machine2 *api.VirtualMachine, pod *corev1.Pod) error {
-	if pod.Spec.NodeName != "" {
-		machine2.Status.NodeName = pod.Spec.NodeName
-	}
-	if pod.Status.HostIP != "" {
-		machine2.Status.NodeIP = pod.Status.HostIP
-	}
-	switch {
-	case pod.DeletionTimestamp != nil:
-		machine2.Status.State = api.StateStopping
-	case common.IsPodReady(pod):
-		machine2.Status.State = api.StateRunning
-	default:
-		machine2.Status.State = api.StatePending
-	}
-	return ctrl.updateMachineStatus(machine, machine2)
-}
+func (ctrl *VirtualMachineController) updateMachineStatusWithPod(machine *api.VirtualMachine, pod *corev1.Pod) error {
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		//toUpdate, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine.Name, metav1.GetOptions{})
+		toUpdate, err := ctrl.machineLister.Get(machine.Name)
+		original := toUpdate.DeepCopy()
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			} else {
+				glog.Errorf("unknown error encountered when updating machine status with pod %v", err)
+			}
+		}
+		if pod.Spec.NodeName != "" {
+			toUpdate.Status.NodeName = pod.Spec.NodeName
+		}
+		if pod.Status.HostIP != "" {
+			toUpdate.Status.NodeIP = pod.Status.HostIP
+		}
+		switch {
+		case pod.DeletionTimestamp != nil:
+			toUpdate.Status.State = api.StateStopping
+		case common.IsPodReady(pod):
+			toUpdate.Status.State = api.StateRunning
+		default:
+			toUpdate.Status.State = api.StatePending
+		}
+		if !reflect.DeepEqual(original.Status, toUpdate.Status) ||
+			!reflect.DeepEqual(original.Finalizers, toUpdate.Finalizers) ||
+			!reflect.DeepEqual(original.Spec, toUpdate.Spec) {
+			glog.V(5).Infof("updating machine status with pod for %s", machine.Name)
+			toUpdate, updateErr := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(toUpdate)
+			if err := ctrl.verifyMachine(toUpdate); err != nil {
+				glog.Errorf("error while verifying machine!!! %s", toUpdate.Name)
+			}
+			return updateErr
+		}
+		return nil
+	})
 
-func (ctrl *VirtualMachineController) updateMachineStatus(current *api.VirtualMachine, updated *api.VirtualMachine) (err error) {
-	if !reflect.DeepEqual(current.Status, updated.Status) ||
-		!reflect.DeepEqual(current.Finalizers, updated.Finalizers) ||
-		!reflect.DeepEqual(current.Spec, updated.Spec) {
-		updated, err = ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(updated)
+	if retryErr != nil {
+		glog.Errorf("error while updating vm object while updating machine status with pod %v", retryErr)
 	}
-	return
+	return retryErr
 }
 
 func (ctrl *VirtualMachineController) deleteMachinePods(machine *api.VirtualMachine) error {
@@ -281,20 +342,118 @@ func (ctrl *VirtualMachineController) deleteMachinePods(machine *api.VirtualMach
 	if len(pods) == 0 {
 		return apierrors.NewNotFound(corev1.Resource("pods"), machine.Name+"-*")
 	}
+	needsDelete := false
+	for _, v := range pods {
+		if v.DeletionTimestamp == nil {
+			needsDelete = true
+		}
+	}
+	if needsDelete {
+		return ctrl.kubeClient.CoreV1().Pods(common.NamespaceVM).DeleteCollection(
+			&metav1.DeleteOptions{},
+			metav1.ListOptions{LabelSelector: machinePodSelector.String()})
+	}
 
-	return ctrl.kubeClient.CoreV1().Pods(common.NamespaceVM).DeleteCollection(
-		&metav1.DeleteOptions{},
-		metav1.ListOptions{LabelSelector: machinePodSelector.String()})
+	return nil
 }
 
 func (ctrl *VirtualMachineController) setTerminating(machine *api.VirtualMachine) error {
-	mutable := machine.DeepCopy()
-	mutable.Status.State = api.StateTerminating
-	return ctrl.updateMachineStatus(machine, mutable)
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		//toUpdate, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine.Name, metav1.GetOptions{})
+		toUpdate, err := ctrl.machineLister.Get(machine.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			} else {
+				glog.Errorf("unknown error encountered when setting terminating %v", err)
+			}
+		}
+		if toUpdate.Status.State == api.StateTerminating {
+			return nil
+		}
+		toUpdate.Status.State = api.StateTerminating
+		glog.V(5).Infof("Setting terminating for %s", machine.Name)
+		toUpdate, updateErr := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(toUpdate)
+		if err := ctrl.verifyMachine(toUpdate); err != nil {
+			glog.Errorf("error while verifying machine!!! %s", toUpdate.Name)
+		}
+		return updateErr
+	})
+
+	if retryErr != nil {
+		glog.Errorf("error while updating vm object while setting terminating %v", retryErr)
+	}
+	return retryErr
 }
 
 func (ctrl *VirtualMachineController) removeFinalizer(machine *api.VirtualMachine) error {
-	mutable := machine.DeepCopy()
-	mutable.Finalizers = []string{}
-	return ctrl.updateMachineStatus(machine, mutable)
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		//toUpdate, err := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Get(machine.Name, metav1.GetOptions{})
+		toUpdate, err := ctrl.machineLister.Get(machine.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			} else {
+				glog.Errorf("unknown error encountered when setting terminating %v", err)
+			}
+		}
+		if reflect.DeepEqual(toUpdate.Finalizers, []string{}) {
+			return nil
+		}
+		toUpdate.Finalizers = []string{}
+		glog.V(5).Infof("removing finalizer for %s", machine.Name)
+		toUpdate, updateErr := ctrl.vmClient.VirtualmachineV1alpha1().VirtualMachines().Update(toUpdate)
+		if err := ctrl.verifyMachine(toUpdate); err != nil {
+			glog.Errorf("error while verifying machine!!! %s", toUpdate.Name)
+		}
+		return updateErr
+	})
+
+	if retryErr != nil {
+		glog.Errorf("error while updating vm object while setting terminating %v", retryErr)
+	}
+	return retryErr
+}
+
+func (ctrl *VirtualMachineController) verifyMachine(machine *api.VirtualMachine) error {
+	var err error
+	glog.V(5).Infof("Verifying machine %s", machine.Name)
+	for i := 0; i < 25; i++ {
+		var fromCache *api.VirtualMachine
+		fromCache, err = ctrl.machineLister.Get(machine.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				break
+			}
+			glog.Error(err)
+			return err
+		}
+		if resourceVersionAtLeast(fromCache.ResourceVersion, machine.ResourceVersion) {
+			glog.V(5).Infof("resource version matched for %s", machine.Name)
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	glog.Errorf("resource version didn't match for in time%s", machine.Name)
+	return nil
+
+}
+
+// borrowed from longhorn
+func resourceVersionAtLeast(curr, min string) bool {
+	// skip unit testing code
+	if curr == "" || min == "" {
+		return true
+	}
+	currVersion, err := strconv.ParseInt(curr, 10, 64)
+	if err != nil {
+		logrus.Errorf("datastore: failed to parse current resource version %v: %v", curr, err)
+		return false
+	}
+	minVersion, err := strconv.ParseInt(min, 10, 64)
+	if err != nil {
+		logrus.Errorf("datastore: failed to parse minimal resource version %v: %v", min, err)
+		return false
+	}
+	return currVersion >= minVersion
 }

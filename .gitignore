@@ -1,7 +1,7 @@
 bin/
 release/
 .vagrant/
-
+.idea
 # RKE
 cluster*.yaml
 inventory*

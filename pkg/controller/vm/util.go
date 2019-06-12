@@ -15,6 +15,10 @@ import (
 	"github.com/rancher/vm/pkg/common"
 )
 
+func GetJobName(machine *v1alpha1.VirtualMachine, jobType string) string {
+	return fmt.Sprintf("%s-%s", machine.Name, jobType)
+}
+
 func GetAlivePods(pods []*corev1.Pod) []*corev1.Pod {
 	var alivePods []*corev1.Pod
 	for _, pod := range pods {

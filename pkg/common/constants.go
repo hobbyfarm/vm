@@ -15,6 +15,7 @@ const (
 
 	LabelApp              = "ranchervm"
 	LabelRoleMigrate      = "migrate"
+	LabelRoleCleanup      = "cleanup"
 	LabelRoleVM           = "vm"
 	LabelRoleNoVNC        = "novnc"
 	LabelRoleMachineImage = "machineimage"

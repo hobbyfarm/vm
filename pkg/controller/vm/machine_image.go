@@ -294,6 +294,19 @@ func getPullImagePod(machineImage *api.MachineImage, node *v1.Node) *v1.Pod {
 			},
 			NodeName:      node.Name,
 			RestartPolicy: v1.RestartPolicyNever,
+			Tolerations: []v1.Toleration{
+				{
+					Key: "node-role.kubernetes.io/controlplane",
+					Operator: v1.TolerationOpExists,
+					Effect: "NoSchedule",
+				},
+				{
+					Key: "node-role.kubernetes.io/etcd",
+					Operator: v1.TolerationOpExists,
+					Effect: "NoExecute",
+				},
+
+			},
 		},
 	}
 }
